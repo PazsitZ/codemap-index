@@ -216,19 +216,19 @@ LANGUAGES: dict[str, LanguageSpec] = {
 DEFAULT_IGNORE_DIRS = {
     "node_modules", ".git", "__pycache__", ".venv", "venv", "build", "dist",
     "out", "target", "coverage", ".mypy_cache", ".pytest_cache", ".ruff_cache",
-    ".next", "vendor", ".gradle", ".idea",
+    ".next", "vendor", ".gradle", ".idea", "tests", "test", "spec",
 }
 
 MANIFEST_FILENAME = ".codemap-manifest.json"
-MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2
 # Bump this (or change the model) to invalidate every cached LLM purpose at once.
 PROMPT_VERSION = "1"
 MAX_FILE_BYTES_DEFAULT = 40_000
 
 # Rough token-estimate heuristics for --dry-run (English/code ≈ 4 chars/token).
 CHARS_PER_TOKEN = 4
-PROMPT_OVERHEAD_TOKENS = 60       # the fixed instruction sent with each purpose call
-PURPOSE_OUTPUT_TOKENS = 30        # one short sentence back
+PROMPT_OVERHEAD_TOKENS = 300    # JSON schema + instruction overhead
+PURPOSE_OUTPUT_TOKENS = 750     # structured JSON output per file
 
 
 @dataclass
@@ -244,6 +244,7 @@ class Config:
     changed_only: bool
     force: bool
     dry_run: bool
+    lite_llm: bool                  # one-sentence summary instead of full JSON descriptions
     price_in: Optional[float]       # USD per 1M input tokens (optional)
     price_out: Optional[float]      # USD per 1M output tokens (optional)
     provider: str                   # "ollama" | "openrouter" | "openai"
@@ -365,6 +366,9 @@ class Declaration:
     name: str
     kind: str
     doc: Optional[str] = None
+    signature: Optional[str] = None          # "(params) -> ret" for funcs/methods
+    members: list[Declaration] = field(default_factory=list)  # methods on a class
+    is_class: bool = False                    # True when extracted from spec.class_types
 
 
 @dataclass
@@ -384,6 +388,8 @@ class FileInfo:
     used_by: list[str] = field(default_factory=list)
     purpose: str = ""
     tags: list[str] = field(default_factory=list)
+    descriptions: dict = field(default_factory=dict)
+    # {"overview": "...", "classes": {cls: {"description": "...", "methods": {m: "..."}}}, "functions": {fn: "..."}}
 
 
 _PARSER_CACHE: dict[str, object] = {}
@@ -526,9 +532,8 @@ def _extract_imports(spec: LanguageSpec, node, source: str, anchor: list[str]) -
         text = re.sub(r"^import\s+", "", node.text.decode("utf-8", "replace").strip())
         text = re.sub(r"\s+as\s+\w+$", "", text.rstrip(";").strip())
         return [text] if text else []
-
     # python
-    if node.type == "import_statement":  # import a.b, c  -> ["a.b", "c"]
+    if node.type == "import_statement":
         return [n.text.decode("utf-8", "replace").split(" as ")[0].strip()
                 for n in node.children_by_field_name("name")]
     if node.type == "import_from_statement":
@@ -542,9 +547,9 @@ def _extract_imports(spec: LanguageSpec, node, source: str, anchor: list[str]) -
         tail = mtext[dots:]
         # N dots climb (N-1) packages up from the importing file's package.
         base = anchor[: len(anchor) - (dots - 1)] if (dots - 1) <= len(anchor) else []
-        if tail:                                 # from .mod import X -> base.mod (a file)
+        if tail:                                 # from .mod import X -> base.mod
             return [".".join([*base, *tail.split(".")])]
-        # from . import a, b -> base.a, base.b (the imported names are submodules)
+        # from . import a, b -> base.a, base.b
         return [".".join([*base, n.text.decode("utf-8", "replace")])
                 for n in node.children_by_field_name("name")]
     return []
@@ -557,6 +562,42 @@ def _unwrap(node):
             if child.type in {"function_definition", "class_definition"}:
                 return child
     return node
+
+
+MEANINGFUL_DUNDERS = {"__init__", "__call__", "__str__", "__repr__", "__enter__", "__exit__"}
+
+
+def _extract_signature_python(node) -> str:
+    """Python-specific: extract (params) -> return_type from a function_definition node.
+    Removes self/cls; prefixes async when present. Collapses newlines for table output."""
+    is_async = any(c.type == "async" for c in node.children)
+    params_node = node.child_by_field_name("parameters")
+    params = "()"
+    if params_node:
+        raw = params_node.text.decode("utf-8", "replace")
+        inner = raw[1:-1].strip()
+        # Collapse internal whitespace/newlines to a single space
+        inner = re.sub(r'\s+', ' ', inner)
+        # Remove leading self/cls (with optional ': Type') and following comma+space
+        inner = re.sub(r'^(?:self|cls)(?:\s*:\s*[^,)]+)?(?:\s*,\s*)?', '', inner).strip()
+        params = f"({inner})"
+    ret = ""
+    ret_node = node.child_by_field_name("return_type")
+    if ret_node:
+        ret = f" -> {ret_node.text.decode('utf-8', 'replace')}"
+    prefix = "async " if is_async else ""
+    return f"{prefix}{params}{ret}"
+
+
+def _extract_signature(node, spec: LanguageSpec) -> str:
+    """Generic dispatcher for signature extraction.
+    Python: detailed extraction with self/cls removal and return type.
+    Other languages: grab raw parameters node text (no self/cls to strip)."""
+    if spec.name == "python":
+        return _extract_signature_python(node)
+    # Kotlin / Java / C: parameter syntax is already readable as-is.
+    params_node = node.child_by_field_name("parameters")
+    return params_node.text.decode("utf-8", "replace") if params_node else "()"
 
 
 def extract_file_info(path: Path, config: Config, spec: LanguageSpec) -> FileInfo:
@@ -591,10 +632,39 @@ def extract_file_info(path: Path, config: Config, spec: LanguageSpec) -> FileInf
             name = _node_name(child)
             if not name or name.startswith("_"):
                 continue
-            first_line = source[child.start_byte:child.end_byte].splitlines()[0]
-            info.declarations.append(
-                Declaration(name=name, kind=_declaration_kind(child, spec, first_line))
-            )
+            lines = source[child.start_byte:child.end_byte].splitlines()
+            first_line = lines[0] if lines else ""
+            if (first_line == "") and len(lines) > 1:
+                print(f"  ⚠ empty first line in {name} at {rel}:{child.start_point[0]+1}", file=sys.stderr)
+                first_line = lines[1]
+            kind = _declaration_kind(child, spec, first_line)
+
+            if ctype in spec.class_types:
+                # Extract public methods from the class body
+                members: list[Declaration] = []
+                body = child.child_by_field_name("body")
+                if body is not None:
+                    for raw_member in body.children:
+                        m = _unwrap(raw_member)
+                        if m.type not in spec.func_types:
+                            continue
+                        mname = _node_name(m)
+                        if not mname:
+                            continue
+                        is_dunder = mname.startswith("__") and mname.endswith("__")
+                        is_private = mname.startswith("_") and not is_dunder
+                        if is_private or (is_dunder and mname not in MEANINGFUL_DUNDERS):
+                            continue
+                        members.append(Declaration(
+                            name=mname, kind="function",
+                            signature=_extract_signature(m, spec),
+                        ))
+                info.declarations.append(Declaration(
+                    name=name, kind=kind, is_class=True, members=members,
+                ))
+            else:
+                sig = _extract_signature(child, spec) if ctype in spec.func_types else None
+                info.declarations.append(Declaration(name=name, kind=kind, signature=sig))
 
     # Annotations / decorators anywhere in the file (cheap signal for tagging).
     info.annotations = sorted(set(re.findall(r"@(\w+)", source)))
@@ -640,13 +710,11 @@ def build_symbol_table(
     return symbols, dict(packages)
 
 
-def _imported_symbols(rel: str, info: FileInfo, spec: LanguageSpec) -> list[str]:
-    """Resolvable candidate targets for each import in this file."""
-    out: list[str] = []
-    for imp in info.imports:
-        out.append(imp)                                      # module path / FQN / include
-        if spec.symbol_strategy == "include_path":
-            out.append(Path(imp).name)                       # also match by header basename
+def _imported_symbols(imp: str, spec: LanguageSpec) -> list[str]:
+    """Lookup candidates for a single import string."""
+    out = [imp]
+    if spec.symbol_strategy == "include_path":
+        out.append(Path(imp).name)
     return out
 
 
@@ -669,7 +737,7 @@ def resolve_graph(all_info: dict[str, FileInfo], config: Config) -> None:
                 for f in packages.get(imp[:-2], []):
                     targets.add(f)
             else:
-                for cand in _imported_symbols(rel, info, spec):
+                for cand in _imported_symbols(imp, spec):
                     if cand in symbols:
                         targets.add(symbols[cand])
                         break
@@ -733,14 +801,14 @@ class Manifest:
         if payload.get("prompt_version") == PROMPT_VERSION and payload.get("model") == self._model:
             self._data = payload.get("files", {})
 
-    def cached_purpose(self, rel: str, h: str) -> Optional[str]:
+    def cached_descriptions(self, rel: str, h: str) -> Optional[dict]:
         entry = self._data.get(rel)
         if entry and entry.get("hash") == h:
-            return entry.get("purpose")
+            return entry.get("descriptions")
         return None
 
-    def record(self, rel: str, h: str, purpose: str) -> None:
-        self._data[rel] = {"hash": h, "purpose": purpose}
+    def record(self, rel: str, h: str, descriptions: dict) -> None:
+        self._data[rel] = {"hash": h, "descriptions": descriptions}
 
     def known_files(self) -> set[str]:
         return set(self._data)
@@ -758,23 +826,75 @@ class Manifest:
         self._path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-class PurposeProvider:
-    """Generates a one-line semantic purpose for a file. Subclasses talk to a
-    specific backend; all degrade gracefully to a fallback string on failure so
-    one bad request never aborts the build."""
+def _empty_descriptions(info: FileInfo) -> dict:
+    """Fallback descriptions using existing docstrings; all LLM fields empty."""
+    return {
+        "overview": info.file_doc or "(undocumented — add a module docstring)",
+        "classes": {
+            decl.name: {
+                "description": "",
+                "methods": {m.name: "" for m in decl.members},
+            }
+            for decl in info.declarations if decl.is_class
+        },
+        "functions": {
+            decl.name: ""
+            for decl in info.declarations if not decl.is_class and decl.kind == "function"
+        },
+    }
 
-    def purpose(self, snippet: str, filename: str) -> str:
-        raise NotImplementedError
+
+def _build_llm_schema(info: FileInfo) -> dict:
+    """Build the JSON schema the LLM must fill in."""
+    return {
+        "overview": "<2-3 sentences describing what this module does and why>",
+        "classes": {
+            decl.name: {
+                "description": "<one line>",
+                "methods": {m.name: "<one line>" for m in decl.members},
+            }
+            for decl in info.declarations if decl.is_class
+        },
+        "functions": {
+            decl.name: "<one line>"
+            for decl in info.declarations if not decl.is_class and decl.kind == "function"
+        },
+    }
 
 
-_PURPOSE_INSTRUCTION = (
+_LITE_LLM_INSTRUCTION = (
     "Summarize what this source file does in ONE sentence, max 14 words. "
     "Output only the sentence — no preamble, no trailing period."
 )
 
 
-def _purpose_prompt(snippet: str, filename: str) -> str:
-    return f"Source file: {filename}\n{_PURPOSE_INSTRUCTION}\n\n```\n{snippet[:2000]}\n```"
+def _lite_llm_prompt(snippet: str, filename: str) -> str:
+    return f"Source file: {filename}\n{_LITE_LLM_INSTRUCTION}\n\n```\n{snippet[:2000]}\n```"
+
+
+def _llm_prompt(snippet: str, filename: str, schema: dict) -> str:
+    FIRST_SNIPPET_SIZE = 1500
+    LAST_SNIPPET_SIZE = 500
+    if (len(snippet) > FIRST_SNIPPET_SIZE):
+        remainder = len(snippet) - FIRST_SNIPPET_SIZE
+        snippet_end = "\n... (truncated) ...\n" + snippet[-1 * min(remainder, LAST_SNIPPET_SIZE):]
+    else:
+        snippet_end = ""
+    return (
+        f"Document the source file `{filename}`.\n\n"
+        f"```\n{snippet[:FIRST_SNIPPET_SIZE]}{snippet_end}\n```\n\n"
+        "Return ONLY a JSON object matching this exact schema. "
+        "No markdown fences, no extra keys, no preamble:\n\n"
+        f"{json.dumps(schema, indent=2)}"
+    )
+
+
+class PurposeProvider:
+    """Generates structured descriptions for a file. Subclasses talk to a specific
+    backend; all return {} on failure so one bad request never aborts the build."""
+
+    def purpose(self, snippet: str, filename: str, schema: Optional[dict]) -> dict:
+        raise NotImplementedError
 
 
 class OllamaProvider(PurposeProvider):
@@ -784,25 +904,32 @@ class OllamaProvider(PurposeProvider):
         self.url, self.model, self.timeout = url, model, timeout
         self._down = False
 
-    def purpose(self, snippet: str, filename: str) -> str:
+    def purpose(self, snippet: str, filename: str, schema: Optional[dict]) -> dict:
         if self._down:
-            return "(undocumented — model unavailable)"
+            return {}
+        lite = schema is None
         body = json.dumps({
-            "model": self.model, "prompt": _purpose_prompt(snippet, filename),
-            "stream": False, "think": False,
-            "options": {"num_predict": 60, "temperature": 0.1},
+            "model": self.model,
+            "prompt": _lite_llm_prompt(snippet, filename) if lite else _llm_prompt(snippet, filename, schema),
+            "stream": False, "think": False, "enable_thinking": False,
+            "options": {"num_predict": 60, "temperature": 0.1} if lite else {"num_predict": 600, "temperature": 0.5},
         }).encode()
         try:
             req = urllib.request.Request(
                 self.url, data=body, headers={"Content-Type": "application/json"}, method="POST"
             )
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                text = json.loads(resp.read()).get("response", "").strip().rstrip(".")
-                return text or "(undocumented)"
+                raw = json.loads(resp.read()).get("response", "").strip()
+            if lite:
+                return {"overview": raw.rstrip("."), "classes": {}, "functions": {}}
+            raw = re.sub(r"^```[a-z]*\n?", "", raw).rstrip("`").strip()
+            return json.loads(raw)
+        except json.JSONDecodeError as exc:
+            print(f"    ⚠ LLM returned invalid JSON for {filename}: {exc}", file=sys.stderr)
         except Exception as exc:  # noqa: BLE001
             print(f"  ⚠ Ollama unavailable ({exc}); continuing without it", file=sys.stderr)
             self._down = True
-            return "(undocumented — model unavailable)"
+        return {}
 
 
 class OpenAICompatProvider(PurposeProvider):
@@ -818,16 +945,25 @@ class OpenAICompatProvider(PurposeProvider):
         self.timeout, self.max_retries = timeout, max_retries
         self._down = False
 
-    def purpose(self, snippet: str, filename: str) -> str:
+    def purpose(self, snippet: str, filename: str, schema: Optional[dict]) -> dict:
         if self._down:
-            return "(undocumented — model unavailable)"
+            return {}
+        lite = schema is None
+        if lite:
+            prompt = _lite_llm_prompt(snippet, filename)
+            system_msg = _LITE_LLM_INSTRUCTION
+            max_tokens = 60
+        else:
+            prompt = _llm_prompt(snippet, filename, schema)
+            system_msg = "You are a code documentation assistant. Return only valid JSON."
+            max_tokens = 750
         body = json.dumps({
             "model": self.model,
             "messages": [
-                {"role": "system", "content": _PURPOSE_INSTRUCTION},
-                {"role": "user", "content": _purpose_prompt(snippet, filename)},
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": prompt},
             ],
-            "max_tokens": 60, "temperature": 0.1,
+            "max_tokens": max_tokens, "temperature": 0.1,
         }).encode()
         headers = {
             "Content-Type": "application/json",
@@ -842,8 +978,14 @@ class OpenAICompatProvider(PurposeProvider):
                 req = urllib.request.Request(self.url, data=body, headers=headers, method="POST")
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                     data = json.loads(resp.read())
-                    text = data["choices"][0]["message"]["content"].strip().rstrip(".")
-                    return text or "(undocumented)"
+                    raw = data["choices"][0]["message"]["content"].strip()
+                if lite:
+                    return {"overview": raw.rstrip("."), "classes": {}, "functions": {}}
+                raw = re.sub(r"^```[a-z]*\n?", "", raw).rstrip("`").strip()
+                return json.loads(raw)
+            except json.JSONDecodeError as exc:
+                print(f"    ⚠ LLM returned invalid JSON for {filename}: {exc}", file=sys.stderr)
+                return {}
             except urllib.error.HTTPError as exc:
                 if exc.code in (429, 500, 502, 503, 504) and attempt < self.max_retries - 1:
                     time.sleep(backoff)
@@ -852,12 +994,12 @@ class OpenAICompatProvider(PurposeProvider):
                 print(f"  ⚠ {self.model} request failed (HTTP {exc.code}); continuing without LLM",
                       file=sys.stderr)
                 self._down = True
-                return "(undocumented — model unavailable)"
+                return {}
             except Exception as exc:  # noqa: BLE001
                 print(f"  ⚠ LLM request failed ({exc}); continuing without LLM", file=sys.stderr)
                 self._down = True
-                return "(undocumented — model unavailable)"
-        return "(undocumented — model unavailable)"
+                return {}
+        return {}
 
 
 # provider -> (default endpoint, default model, API-key env var). --model / --base-url
@@ -877,21 +1019,27 @@ def make_provider(config: Config) -> Optional[PurposeProvider]:
     return OpenAICompatProvider(config.base_url, config.api_key, config.model)
 
 
-def resolve_purpose(
-    info: FileInfo, path: Path, h: str, manifest: Manifest, provider: Optional[PurposeProvider]
-) -> str:
-    """Ladder: file doc -> cached LLM purpose -> fresh LLM -> fallback. The LLM is
-    never asked about a file that already documents itself."""
+def resolve_descriptions(
+    info: FileInfo, path: Path, h: str, manifest: Manifest,
+    provider: Optional[PurposeProvider], lite_llm: bool = False,
+) -> dict:
+    """Ladder: file doc -> cached descriptions -> fresh LLM -> fallback.
+    The LLM is never asked about a file that already documents itself.
+    lite_llm=True uses a one-sentence prompt instead of the full JSON schema."""
     if info.file_doc:
-        return info.file_doc.rstrip(".")
-    cached = manifest.cached_purpose(info.rel_path, h)
+        desc = _empty_descriptions(info)
+        desc["overview"] = info.file_doc.rstrip(".")
+        return desc
+    cached = manifest.cached_descriptions(info.rel_path, h)
     if cached:
         return cached
     if provider is not None:
-        purpose = provider.purpose(info.source_snippet, path.name)
-        manifest.record(info.rel_path, h, purpose)
-        return purpose
-    return "(undocumented — add a docstring/KDoc or run without --no-llm)"
+        schema = None if lite_llm else _build_llm_schema(info)
+        result = provider.purpose(info.source_snippet, path.name, schema)
+        if result:
+            manifest.record(info.rel_path, h, result)
+            return result
+    return _empty_descriptions(info)
 
 
 def infer_tags(info: FileInfo, signals: dict[str, tuple[str, ...]]) -> list[str]:
@@ -980,29 +1128,82 @@ def write_file_docs(all_info: dict[str, FileInfo], config: Config) -> int:
         doc.parent.mkdir(parents=True, exist_ok=True)
         notes = _load_file_notes(doc)
 
-        lines = [
-            f"# {Path(rel).name}",
-            f"`{rel}`",
+        desc = info.descriptions
+        overview = desc.get("overview", "").strip() or "(undocumented)"
+        cls_descs = desc.get("classes", {})
+        fn_descs = desc.get("functions", {})
+
+        lines: list[str] = [
+            f"# `{rel}`",
+            "",
             "<!-- auto-generated by codemap.py — edit ONLY inside the notes block -->",
             "",
-            "## Purpose",
-            info.purpose,
+            overview,
             "",
-            "## Exports",
-            _fmt_exports(info.declarations),
-            "",
-            "## Internal dependencies",
-            ", ".join(_wikilink(d) for d in info.internal_deps) or "—",
-            "",
-            "## External dependencies",
-            _fmt_list(info.external_deps),
-            "",
-            "## Used by",
-            ", ".join(_wikilink(u) for u in info.used_by) or "—",
         ]
+
+        # Classes
+        class_decls = [d for d in info.declarations if d.is_class]
+        if class_decls:
+            lines += ["---", "", "## Classes", ""]
+            for cls in class_decls:
+                cls_desc_block = cls_descs.get(cls.name, {})
+                cls_desc = (
+                    cls_desc_block.get("description", "") if isinstance(cls_desc_block, dict) else ""
+                )
+                lines += [
+                    f"### `{cls.name}`",
+                    cls_desc or "_(no description)_",
+                    "",
+                ]
+                if cls.members:
+                    lines += [
+                        "| Method | Signature | Description |",
+                        "|--------|-----------|-------------|",
+                    ]
+                    method_descs = (
+                        cls_desc_block.get("methods", {}) if isinstance(cls_desc_block, dict) else {}
+                    )
+                    for m in cls.members:
+                        sig = m.signature or "()"
+                        m_desc = (method_descs.get(m.name, "") or "—") if isinstance(method_descs, dict) else "—"
+                        lines.append(f"| `{m.name}` | `{sig}` | {m_desc} |")
+                    lines.append("")
+
+        # Module-level functions
+        fn_decls = [d for d in info.declarations if not d.is_class and d.kind == "function"]
+        if fn_decls:
+            lines += [
+                "---", "",
+                "## Functions", "",
+                "| Function | Signature | Description |",
+                "|----------|-----------|-------------|",
+            ]
+            for fn in fn_decls:
+                sig = fn.signature or "()"
+                fn_desc = (fn_descs.get(fn.name, "") or "—") if isinstance(fn_descs, dict) else "—"
+                lines.append(f"| `{fn.name}` | `{sig}` | {fn_desc} |")
+            lines.append("")
+
+        # Depends on (internal deps as wikilinks, filter __init__.py)
+        int_deps = [d for d in info.internal_deps if not d.endswith("__init__.py")]
+        if int_deps:
+            wikilinks = " ".join(_wikilink(d) for d in int_deps)
+            lines += ["---", "", "## Depends on", "", wikilinks, ""]
+
+        # Cross-references
+        used_by_fmt = ", ".join(f"`{u}`" for u in sorted(info.used_by)) or "—"
+        lines += [
+            "---", "",
+            "## Cross-references", "",
+            f"- **External deps**: {_fmt_list(info.external_deps)}",
+            f"- **Used by**: {used_by_fmt}",
+            "",
+        ]
+
         if info.tags:
-            lines += ["", "## Tags", " ".join(info.tags)]
-        lines += ["", "## Notes", "<!-- notes -->", notes, "<!-- /notes -->", ""]
+            lines += ["## Tags", " ".join(info.tags), ""]
+        lines += ["## Notes", "<!-- notes -->", notes, "<!-- /notes -->", ""]
 
         doc.write_text("\n".join(lines), encoding="utf-8")
         written += 1
@@ -1146,15 +1347,13 @@ def git_staged(config: Config) -> Optional[set[str]]:
 def estimate_generation(
     all_info: dict[str, FileInfo], to_resolve: set[str], manifest: Manifest, config: Config
 ) -> dict[str, int]:
-    """Estimate the LLM cost a real run would incur: counts only files that would
-    actually hit the model (in scope, no doc comment, not already cached) and
-    sums snippet-sized input + one-sentence output tokens."""
+    """Estimate LLM cost for a real run: counts only files that would actually hit the model."""
     calls = in_tok = out_tok = free = 0
     for rel, info in all_info.items():
         if rel not in to_resolve:
             free += 1
             continue
-        if info.file_doc or manifest.cached_purpose(rel, file_hash(config.root / rel)) is not None:
+        if info.file_doc or manifest.cached_descriptions(rel, file_hash(config.root / rel)) is not None:
             free += 1
             continue
         calls += 1
@@ -1233,14 +1432,24 @@ def build(config: Config) -> None:
             path = config.root / rel
             h = file_hash(path)
             if rel in to_resolve:
-                had_doc = bool(info.file_doc) or manifest.cached_purpose(rel, h) is not None
-                info.purpose = resolve_purpose(info, path, h, manifest, provider)
+                had_doc = bool(info.file_doc) or manifest.cached_descriptions(rel, h) is not None
+                info.descriptions = resolve_descriptions(info, path, h, manifest, provider, config.lite_llm)
                 if provider is not None and not had_doc:
                     llm_calls += 1
             else:
-                info.purpose = info.file_doc.rstrip(".") if info.file_doc else (
-                    manifest.cached_purpose(rel, h) or "(undocumented)"
-                )
+                if info.file_doc:
+                    d = _empty_descriptions(info)
+                    d["overview"] = info.file_doc.rstrip(".")
+                    info.descriptions = d
+                else:
+                    info.descriptions = manifest.cached_descriptions(rel, h) or _empty_descriptions(info)
+            # One-line purpose for INDEX/MOC: first sentence of overview
+            overview = info.descriptions.get("overview", "")
+            if overview and not overview.startswith("(undocumented"):
+                m = re.match(r'^(.+?[.!?])(?:\s|$)', overview, re.DOTALL)
+                info.purpose = m.group(1).rstrip() if m else overview[:120].rstrip()
+            else:
+                info.purpose = overview or "(undocumented)"
             info.tags = infer_tags(info, config.tag_signals_for(config.spec_for(path)))
             advance()
 
@@ -1295,6 +1504,8 @@ def parse_args(argv: list[str]) -> Config:
     p.add_argument("--scan", choices=["auto", "walk", "gradle"], default="auto",
                    help="Source-root discovery (default: auto)")
     p.add_argument("--no-llm", action="store_true", help="Skip the LLM; structure + docstrings only")
+    p.add_argument("--lite-llm", action="store_true",
+                   help="One-sentence summary per file instead of full JSON descriptions (cheaper)")
     p.add_argument("--changed", action="store_true", help="Resolve purpose only for git-staged files")
     p.add_argument("--force", action="store_true", help="Ignore the manifest cache; rebuild all")
     p.add_argument("--dry-run", action="store_true",
@@ -1353,6 +1564,7 @@ def parse_args(argv: list[str]) -> Config:
         changed_only=args.changed,
         force=args.force,
         dry_run=args.dry_run,
+        lite_llm=args.lite_llm,
         price_in=args.price_in,
         price_out=args.price_out,
         provider=args.provider,
@@ -1376,3 +1588,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+s
